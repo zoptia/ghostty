@@ -29,3 +29,5 @@ glad.zip
 
 vgcore.*
 
+zig-pkg/
+/build.zig.zon.full
