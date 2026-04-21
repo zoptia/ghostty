@@ -1,27 +1,22 @@
-//! zoptty backend — minimal proof: TCP control + UDP cell data.
+//! zoptty backend: TCP control + UDP cell data + PTY-backed shell.
 //!
 //! Flow:
-//!   1. TCP listens on 127.0.0.1:TCP_PORT
-//!   2. UDP binds on 127.0.0.1:UDP_PORT
-//!   3. On TCP accept:
-//!      a. Send Handshake (version, udp_port, cell size) framed on TCP.
-//!      b. Receive ResizeEvent from client (includes client's UDP port).
-//!      c. Encode a dummy one-row CellPacket via frame_encoder,
-//!         send over UDP to client.
-//!      d. Close.
-//!
-//! This is not a full server — just verifies:
-//!   - TCP frame in/out works
-//!   - UDP send + frame_encoder wire format works
-//!
-//! For now the "terminal state" is a 5-cell hardcoded row:
-//!   H e l l o  on white-on-black.
+//!   1. Listen TCP on TCP_PORT, bind UDP on UDP_PORT
+//!   2. Accept one client → send Handshake → receive Resize
+//!   3. Spawn /bin/bash on a PTY sized to the client's resize
+//!   4. Loop:
+//!      - Non-blocking read from PTY, feed bytes into Screen
+//!      - For each dirty row, encode CellPacket and send on UDP
+//!      - 10ms sleep
+//!   5. Exit when PTY is closed (shell exits)
 
 const std = @import("std");
 const net = std.Io.net;
 
 const protocol = @import("protocol.zig");
 const frame_encoder = @import("frame_encoder.zig");
+const pty_mod = @import("pty.zig");
+const Screen = @import("screen.zig").Screen;
 
 const log = std.log.scoped(.zoptty_server);
 
@@ -38,12 +33,7 @@ const FrameType = enum(u8) {
     _,
 };
 
-/// Write a TCP frame: [len:u32 LE][type:u8][body...]
-fn writeFrame(
-    w: *std.Io.Writer,
-    frame_type: FrameType,
-    body: []const u8,
-) !void {
+fn writeFrame(w: *std.Io.Writer, frame_type: FrameType, body: []const u8) !void {
     var header: [5]u8 = undefined;
     std.mem.writeInt(u32, header[0..4], @intCast(body.len + 1), .little);
     header[4] = @intFromEnum(frame_type);
@@ -52,15 +42,11 @@ fn writeFrame(
     try w.flush();
 }
 
-/// Read a full TCP frame into buf. Returns (type, payload_len).
-fn readFrame(
-    r: *std.Io.Reader,
-    buf: []u8,
-) !struct { frame_type: FrameType, len: usize } {
+fn readFrame(r: *std.Io.Reader, buf: []u8) !struct { frame_type: FrameType, len: usize } {
     var header: [5]u8 = undefined;
     try r.readSliceAll(&header);
     const total_len = std.mem.readInt(u32, header[0..4], .little);
-    const body_len = total_len - 1; // minus type byte
+    const body_len = total_len - 1;
     if (body_len > buf.len) return error.FrameTooLarge;
     try r.readSliceAll(buf[0..body_len]);
     return .{ .frame_type = @enumFromInt(header[4]), .len = body_len };
@@ -70,7 +56,6 @@ fn readFrame(
 // Wire body structs
 // ---------------------------------------------------------------------------
 
-/// Handshake body (after frame header).
 const HandshakeBody = extern struct {
     version: u32 = 1,
     server_udp_port: u16,
@@ -79,8 +64,6 @@ const HandshakeBody = extern struct {
     font_data_len: u32 = 0,
 };
 
-/// ResizeEvent body. Derived from DESIGN.md InputEvent, extended with
-/// client_udp_port for this transport.
 const ResizeBody = extern struct {
     modifiers: u8 = 0,
     _pad: u8 = 0,
@@ -99,19 +82,16 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
 
-    // Bind TCP listener.
     const tcp_addr: net.IpAddress = net.IpAddress.parseIp4("127.0.0.1", TCP_PORT) catch unreachable;
     var tcp_server = try tcp_addr.listen(io, .{});
     defer tcp_server.deinit(io);
     log.info("TCP listening on 127.0.0.1:{}", .{TCP_PORT});
 
-    // Bind UDP socket.
     const udp_addr: net.IpAddress = net.IpAddress.parseIp4("127.0.0.1", UDP_PORT) catch unreachable;
     var udp_sock = try udp_addr.bind(io, .{ .mode = .dgram });
     defer udp_sock.close(io);
     log.info("UDP bound on 127.0.0.1:{}", .{UDP_PORT});
 
-    // Accept one client, serve, exit.
     var tcp_stream = try tcp_server.accept(io);
     defer tcp_stream.close(io);
     log.info("TCP accepted client", .{});
@@ -131,64 +111,100 @@ fn serveClient(
     tcp_w: *std.Io.Writer,
     udp: *net.Socket,
 ) !void {
-    // 1. Send handshake over TCP.
+    // 1. Handshake.
     const hs: HandshakeBody = .{ .server_udp_port = UDP_PORT };
     try writeFrame(tcp_w, .handshake, std.mem.asBytes(&hs));
     log.info("sent Handshake", .{});
 
-    // 2. Wait for ResizeEvent.
-    var buf: [4096]u8 = undefined;
-    const frame = try readFrame(tcp_r, &buf);
-    if (frame.frame_type != .resize_event) {
-        log.err("expected resize_event, got {t}", .{frame.frame_type});
-        return error.UnexpectedFrame;
-    }
-    const resize: ResizeBody = std.mem.bytesAsValue(ResizeBody, buf[0..@sizeOf(ResizeBody)]).*;
-    log.info("got Resize: cols={} rows={} client_udp={}", .{
+    // 2. Receive resize.
+    var fbuf: [4096]u8 = undefined;
+    const frame = try readFrame(tcp_r, &fbuf);
+    if (frame.frame_type != .resize_event) return error.UnexpectedFrame;
+    const resize: ResizeBody = std.mem.bytesAsValue(ResizeBody, fbuf[0..@sizeOf(ResizeBody)]).*;
+    log.info("Resize: cols={} rows={} client_udp={}", .{
         resize.cols, resize.rows, resize.client_udp_port,
     });
 
-    // 3. Encode and send one dummy CellPacket over UDP.
+    const client_addr: net.IpAddress = net.IpAddress.parseIp4("127.0.0.1", resize.client_udp_port) catch unreachable;
+
+    // 3. Spawn PTY. Run a fixed command for the MVP so we can verify
+    // PTY → screen → UDP without depending on shell login speed.
+    const argv = [_:null]?[*:0]const u8{
+        "/bin/sh",
+        "-c",
+        "echo 'zoptty hello from PTY'; echo 'line 2'; date",
+        null,
+    };
+    var pty = try pty_mod.Pty.spawn(&argv, .{ .rows = resize.rows, .cols = resize.cols });
+    defer pty.deinit();
+    try pty.setNonBlocking();
+    log.info("spawned PTY pid={}", .{pty.pid});
+
+    // 4. Screen + encoder.
+    var screen = try Screen.init(gpa, resize.rows, resize.cols);
+    defer screen.deinit(gpa);
+
     var encoder: frame_encoder.PacketEncoder = .init(gpa);
     defer encoder.deinit();
 
-    const cols: u16 = resize.cols;
-    const cols_usize: usize = @intCast(cols);
-    const bg = try gpa.alloc(protocol.CellBg, cols_usize);
-    defer gpa.free(bg);
-    const cps = try gpa.alloc(u21, cols_usize);
-    defer gpa.free(cps);
-    const styles = try gpa.alloc(protocol.FgStyle, cols_usize);
-    defer gpa.free(styles);
+    // 5. Main loop.
+    var pty_buf: [4096]u8 = undefined;
+    while (true) {
+        // Read any PTY bytes.
+        const n = pty.read(&pty_buf) catch |err| switch (err) {
+            error.WouldBlock, error.Interrupted => @as(usize, 0),
+            error.EndOfFile => {
+                log.info("PTY closed", .{});
+                break;
+            },
+            else => return err,
+        };
+        if (n > 0) {
+            log.info("PTY read {} bytes", .{n});
+            screen.write(pty_buf[0..n]);
+            // Debug: print first 3 rows' codepoints.
+            for (0..@min(3, @as(usize, resize.rows))) |r| {
+                const row = screen.row(@intCast(r));
+                var dbg_buf: [128]u8 = undefined;
+                var dbg_i: usize = 0;
+                for (row.cp) |cp| {
+                    if (cp == 0) {
+                        dbg_buf[dbg_i] = '.';
+                    } else if (cp < 128) {
+                        dbg_buf[dbg_i] = @intCast(cp);
+                    } else {
+                        dbg_buf[dbg_i] = '?';
+                    }
+                    dbg_i += 1;
+                    if (dbg_i == dbg_buf.len) break;
+                }
+                log.info("row[{}]: {s}", .{ r, dbg_buf[0..dbg_i] });
+            }
+        } else if (pty.hasExited()) {
+            log.info("shell exited", .{});
+            break;
+        }
 
-    const black: protocol.CellBg = .{ 0, 0, 0, 255 };
-    const white_style: protocol.FgStyle = .{
-        .color = .{ 255, 255, 255, 255 },
-        .atlas = 0,
-        .flags = .{},
-    };
-    for (bg) |*b| b.* = black;
-    for (styles) |*s| s.* = white_style;
-    for (cps, 0..) |*c, i| c.* = switch (i) {
-        0 => 'H',
-        1 => 'e',
-        2 => 'l',
-        3 => 'l',
-        4 => 'o',
-        else => ' ',
-    };
+        // Flush dirty rows to UDP.
+        for (screen.dirty, 0..) |d, r_usize| {
+            if (!d) continue;
+            const r: u16 = @intCast(r_usize);
+            const row = screen.row(r);
+            var result = try encoder.encodeRowSplit(r, resize.cols, row.bg, row.cp, row.fg, null);
+            defer result.deinit(gpa);
+            for (result.packets) |pkt| {
+                udp.send(io, &client_addr, pkt) catch |err| {
+                    log.warn("UDP send failed: {}", .{err});
+                };
+            }
+            screen.dirty[r_usize] = false;
+        }
 
-    var result = try encoder.encodeRowSplit(0, cols, bg, cps, styles, null);
-    defer result.deinit(gpa);
-
-    const client_addr: net.IpAddress = net.IpAddress.parseIp4("127.0.0.1", resize.client_udp_port) catch unreachable;
-    for (result.packets) |pkt| {
-        try udp.send(io, &client_addr, pkt);
-        log.info("sent CellPacket via UDP ({} bytes)", .{pkt.len});
+        // Small sleep to avoid busy-loop. 10 ms.
+        try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(10), .awake);
     }
 }
 
-// Silence unused warnings when only subset of imports used.
 comptime {
     _ = @import("compression.zig");
     _ = @import("frame_decoder.zig");
