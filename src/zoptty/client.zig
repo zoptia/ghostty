@@ -1,21 +1,17 @@
-//! zoptty test client — loops receiving CellPackets and renders the
-//! current screen state to the local terminal using ANSI escapes.
-//!
-//! Not a real renderer — just meant to visually verify end-to-end.
+//! zoptty test client — connects to the server, renders received
+//! CellPackets into a local alternate-screen, and forwards raw
+//! keystrokes back to the server over TCP.
 
 const std = @import("std");
 const net = std.Io.net;
 
 const c = @cImport({
     @cInclude("unistd.h");
+    @cInclude("termios.h");
 });
 
 const protocol = @import("protocol.zig");
 const frame_decoder = @import("frame_decoder.zig");
-
-fn stderrWrite(bytes: []const u8) void {
-    _ = c.write(2, bytes.ptr, bytes.len);
-}
 
 const log = std.log.scoped(.zoptty_client);
 
@@ -27,6 +23,7 @@ const ROWS: u16 = 24;
 const FrameType = enum(u8) {
     handshake = 1,
     resize_event = 4,
+    pty_input = 10,
     _,
 };
 
@@ -67,11 +64,82 @@ fn readFrame(r: *std.Io.Reader, buf: []u8) !struct { frame_type: FrameType, len:
     return .{ .frame_type = @enumFromInt(header[4]), .len = body_len };
 }
 
+fn stderrWrite(bytes: []const u8) void {
+    _ = c.write(2, bytes.ptr, bytes.len);
+}
+
+// ---------------------------------------------------------------------------
+// Stdin raw-mode handling (on fd 0).
+// ---------------------------------------------------------------------------
+
+var saved_termios: c.termios = undefined;
+var stdin_was_raw: bool = false;
+
+fn enterRawMode() !void {
+    if (c.tcgetattr(0, &saved_termios) != 0) return error.TcgetattrFailed;
+    var raw = saved_termios;
+    // Input: no break sig, no CR-to-NL, no parity, no strip, no flow.
+    raw.c_iflag &= ~@as(c.tcflag_t, c.BRKINT | c.ICRNL | c.INPCK | c.ISTRIP | c.IXON);
+    // Output: keep opost off so terminal codes pass through unchanged.
+    raw.c_oflag &= ~@as(c.tcflag_t, c.OPOST);
+    // Local: no canonical, no echo, no ext, no signal gen.
+    raw.c_lflag &= ~@as(c.tcflag_t, c.ECHO | c.ICANON | c.IEXTEN | c.ISIG);
+    // Control: 8-bit chars.
+    raw.c_cflag |= c.CS8;
+    raw.c_cc[c.VMIN] = 1;
+    raw.c_cc[c.VTIME] = 0;
+    if (c.tcsetattr(0, c.TCSAFLUSH, &raw) != 0) return error.TcsetattrFailed;
+    stdin_was_raw = true;
+}
+
+fn restoreStdin() void {
+    if (stdin_was_raw) {
+        _ = c.tcsetattr(0, c.TCSAFLUSH, &saved_termios);
+        stdin_was_raw = false;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Input thread: reads stdin, sends TCP pty_input frames.
+// ---------------------------------------------------------------------------
+
+const InputThreadArgs = struct {
+    tcp_w: *std.Io.Writer,
+    /// Written by input thread, read by main thread to detect Ctrl-Q exit.
+    /// Signal via null-byte convention: when set to true, main should quit.
+    quit: *std.atomic.Value(bool),
+};
+
+fn inputThread(args: InputThreadArgs) void {
+    var buf: [512]u8 = undefined;
+    while (!args.quit.load(.monotonic)) {
+        const n = c.read(0, &buf, buf.len);
+        if (n <= 0) return;
+        const un: usize = @intCast(n);
+
+        // Exit on Ctrl-Q (0x11) — terminals rarely send this naturally.
+        for (buf[0..un]) |b| if (b == 0x11) {
+            args.quit.store(true, .monotonic);
+            return;
+        };
+
+        writeFrame(args.tcp_w, .pty_input, buf[0..un]) catch |err| {
+            log.err("TCP send failed: {}", .{err});
+            args.quit.store(true, .monotonic);
+            return;
+        };
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
 
-    // 1. TCP connect.
+    // TCP connect + handshake + resize.
     const server_addr: net.IpAddress = net.IpAddress.parseIp4("127.0.0.1", SERVER_TCP) catch unreachable;
     var tcp = try server_addr.connect(io, .{ .mode = .stream });
     defer tcp.close(io);
@@ -83,18 +151,15 @@ pub fn main(init: std.process.Init) !void {
     const tcp_r = &reader.interface;
     const tcp_w = &writer.interface;
 
-    // 2. Read Handshake.
     var buf: [4096]u8 = undefined;
     const hs_frame = try readFrame(tcp_r, &buf);
     if (hs_frame.frame_type != .handshake) return error.UnexpectedFrame;
     const hs = std.mem.bytesAsValue(HandshakeBody, buf[0..@sizeOf(HandshakeBody)]).*;
 
-    // 3. Bind UDP.
     const udp_bind: net.IpAddress = net.IpAddress.parseIp4("127.0.0.1", CLIENT_UDP) catch unreachable;
     var udp = try udp_bind.bind(io, .{ .mode = .dgram });
     defer udp.close(io);
 
-    // 4. Send Resize.
     const resize: ResizeBody = .{
         .cols = COLS,
         .rows = ROWS,
@@ -104,41 +169,75 @@ pub fn main(init: std.process.Init) !void {
     };
     try writeFrame(tcp_w, .resize_event, std.mem.asBytes(&resize));
 
-    // 5. Decoder state.
     var client_state: frame_decoder.ClientState = .init(gpa);
     defer client_state.deinit();
     try client_state.resize(ROWS, COLS);
 
-    // 6. Receive loop — print each row's content as it arrives. No
-    // alternate-screen rendering for this debug build; just log lines.
+    // Put stdin in raw mode and enter alternate screen.
+    try enterRawMode();
+    defer restoreStdin();
+    stderrWrite("\x1b[?1049h\x1b[?25l\x1b[H\x1b[2J");
+    defer stderrWrite("\x1b[?25h\x1b[?1049l");
+
+    // Spawn input thread.
+    var quit: std.atomic.Value(bool) = .init(false);
+    const input_tid = try std.Thread.spawn(
+        .{},
+        inputThread,
+        .{InputThreadArgs{ .tcp_w = tcp_w, .quit = &quit }},
+    );
+    input_tid.detach();
+
+    // Main loop: receive UDP, decode, render.
     var udp_buf: [2048]u8 = undefined;
+    var render_buf: std.ArrayList(u8) = .empty;
+    defer render_buf.deinit(gpa);
+
     const timeout: std.Io.Timeout = .{ .duration = .{
-        .raw = std.Io.Duration.fromMilliseconds(2000),
+        .raw = std.Io.Duration.fromMilliseconds(100),
         .clock = .awake,
     } };
-    while (true) {
-        const msg = udp.receiveTimeout(io, &udp_buf, timeout) catch |err| {
-            if (err == error.Timeout) break;
-            log.err("UDP recv failed: {}", .{err});
-            break;
+    while (!quit.load(.monotonic)) {
+        const msg = udp.receiveTimeout(io, &udp_buf, timeout) catch |err| switch (err) {
+            error.Timeout => continue,
+            else => {
+                log.err("UDP recv: {}", .{err});
+                break;
+            },
         };
-        frame_decoder.decodePacket(msg.data, &client_state) catch |err| {
-            log.warn("decode failed: {}", .{err});
-            continue;
-        };
+        frame_decoder.decodePacket(msg.data, &client_state) catch continue;
 
-        // Print ALL rows that are now non-empty on this receive.
+        render_buf.clearRetainingCapacity();
+        try render_buf.appendSlice(gpa, "\x1b[H"); // cursor home
         for (0..ROWS) |r| {
-            var row_bytes: [COLS]u8 = undefined;
-            var any = false;
-            for (row_bytes[0..], 0..COLS) |*d, col| {
+            try render_buf.appendSlice(gpa, "\x1b[2K");
+            for (0..COLS) |col| {
                 const i = r * @as(usize, COLS) + col;
                 const cp = client_state.fg_codepoints[i];
-                d.* = if (cp == 0) ' ' else if (cp < 128) @intCast(cp) else '?';
-                if (cp != 0) any = true;
+                if (cp == 0) {
+                    try render_buf.append(gpa, ' ');
+                } else {
+                    var utf8_buf: [4]u8 = undefined;
+                    const n = std.unicode.utf8Encode(@intCast(cp), &utf8_buf) catch {
+                        try render_buf.append(gpa, '?');
+                        continue;
+                    };
+                    try render_buf.appendSlice(gpa, utf8_buf[0..n]);
+                }
             }
-            if (any) log.info("row[{}]: {s}", .{ r, std.mem.trimEnd(u8, &row_bytes, " ") });
+            if (r + 1 < ROWS) try render_buf.append(gpa, '\r');
+            if (r + 1 < ROWS) try render_buf.append(gpa, '\n');
         }
+        // Show cursor at server's cursor position if any.
+        if (client_state.cursor) |cur| {
+            var cur_esc: [32]u8 = undefined;
+            const s = std.fmt.bufPrint(&cur_esc, "\x1b[{};{}H", .{
+                client_state.cursor_row + 1,
+                cur.x + 1,
+            }) catch "";
+            try render_buf.appendSlice(gpa, s);
+        }
+        stderrWrite(render_buf.items);
     }
 }
 

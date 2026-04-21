@@ -30,6 +30,9 @@ const UDP_PORT: u16 = 7002;
 const FrameType = enum(u8) {
     handshake = 1,
     resize_event = 4,
+    /// Raw bytes to write directly to the PTY master. The client sends
+    /// whatever the user typed (after stdin raw-mode capture) as-is.
+    pty_input = 10,
     _,
 };
 
@@ -104,6 +107,31 @@ pub fn main(init: std.process.Init) !void {
     try serveClient(gpa, io, &reader.interface, &writer.interface, &udp_sock);
 }
 
+/// Input thread: reads pty_input frames from TCP and writes them to PTY master.
+/// Exits when TCP read fails (client disconnected or server shutdown).
+const InputArgs = struct {
+    tcp_r: *std.Io.Reader,
+    pty: *pty_mod.Pty,
+};
+
+fn inputThread(args: InputArgs) void {
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const frame = readFrame(args.tcp_r, &buf) catch |err| {
+            log.info("input thread: read ended ({})", .{err});
+            return;
+        };
+        switch (frame.frame_type) {
+            .pty_input => {
+                _ = args.pty.write(buf[0..frame.len]) catch |err| {
+                    log.warn("PTY write failed: {}", .{err});
+                };
+            },
+            else => log.warn("input thread: unexpected frame type {t}", .{frame.frame_type}),
+        }
+    }
+}
+
 fn serveClient(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -127,18 +155,24 @@ fn serveClient(
 
     const client_addr: net.IpAddress = net.IpAddress.parseIp4("127.0.0.1", resize.client_udp_port) catch unreachable;
 
-    // 3. Spawn PTY. Run a fixed command for the MVP so we can verify
-    // PTY → screen → UDP without depending on shell login speed.
+    // 3. Spawn PTY. Interactive shell so the user can type.
     const argv = [_:null]?[*:0]const u8{
         "/bin/sh",
-        "-c",
-        "echo 'zoptty hello from PTY'; echo 'line 2'; date",
+        "-i",
         null,
     };
     var pty = try pty_mod.Pty.spawn(&argv, .{ .rows = resize.rows, .cols = resize.cols });
     defer pty.deinit();
     try pty.setNonBlocking();
     log.info("spawned PTY pid={}", .{pty.pid});
+
+    // Spawn TCP-input thread to forward client keystrokes to PTY.
+    var input_thread = try std.Thread.spawn(
+        .{},
+        inputThread,
+        .{InputArgs{ .tcp_r = tcp_r, .pty = &pty }},
+    );
+    defer input_thread.detach();
 
     // 4. Screen + encoder.
     var screen = try Screen.init(gpa, resize.rows, resize.cols);
@@ -160,26 +194,7 @@ fn serveClient(
             else => return err,
         };
         if (n > 0) {
-            log.info("PTY read {} bytes", .{n});
             screen.write(pty_buf[0..n]);
-            // Debug: print first 3 rows' codepoints.
-            for (0..@min(3, @as(usize, resize.rows))) |r| {
-                const row = screen.row(@intCast(r));
-                var dbg_buf: [128]u8 = undefined;
-                var dbg_i: usize = 0;
-                for (row.cp) |cp| {
-                    if (cp == 0) {
-                        dbg_buf[dbg_i] = '.';
-                    } else if (cp < 128) {
-                        dbg_buf[dbg_i] = @intCast(cp);
-                    } else {
-                        dbg_buf[dbg_i] = '?';
-                    }
-                    dbg_i += 1;
-                    if (dbg_i == dbg_buf.len) break;
-                }
-                log.info("row[{}]: {s}", .{ r, dbg_buf[0..dbg_i] });
-            }
         } else if (pty.hasExited()) {
             log.info("shell exited", .{});
             break;
